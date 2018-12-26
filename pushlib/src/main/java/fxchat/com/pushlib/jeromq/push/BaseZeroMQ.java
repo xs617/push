@@ -17,13 +17,14 @@ import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-import fxchat.com.pushlib.jeromq.ZeroMQBroker;
+import fxchat.com.pushlib.jeromq.selfinspection.SelfInspectionHelperHelper;
+import fxchat.com.pushlib.jeromq.selfinspection.SelfInspectionObserver;
 import fxchat.com.pushlib.jeromq.tools.SimpleThreadFactory;
 
 /**
  * Created by wenjiarong on 2018/11/9 0009.
  */
-public abstract class BaseZeroMQ implements IPush {
+public abstract class BaseZeroMQ implements IPush, SelfInspectionObserver {
 
     //region 日志标签
 
@@ -36,54 +37,6 @@ public abstract class BaseZeroMQ implements IPush {
     //endregion
 
     //region 内部成员
-
-    private ZMQ.Context mZMQContext;
-    /**
-     * 与服务器交互的socket
-     */
-    private ZMQ.Socket mCaller;
-    /**
-     * 监听caller状态变化的socket
-     */
-    private ZMQ.Socket mMonitor;
-    /**
-     * 当前使用的数据推送地址
-     */
-    private String currentHost = "";
-    /**
-     * 当前使用的监听地址
-     */
-    private String currentMonitorHost = "";
-
-    /**
-     * 接收数据线程池，暂定两个线程，使用缓存队列
-     */
-    private ThreadPoolExecutor mReceivePool;
-    /**
-     * 监听状态线程池，暂定两个线程，使用缓存队列
-     */
-    private ThreadPoolExecutor mMonitorPool;
-    /**
-     * 接收数据线程池缓存队列，作为变量主要方便调试
-     */
-    private BlockingQueue<Runnable> receiveBlockingDeque = new LinkedBlockingDeque<Runnable>();
-    /**
-     * 监听状态线程池缓存队列，作为变量主要方便调试
-     */
-    private LinkedBlockingDeque<Runnable> monitorBlockingDeque = new LinkedBlockingDeque<Runnable>();
-
-    /**
-     * 启动一个线程承载对ZMQ操作
-     */
-    private HandlerThread handlerThread;
-    /**
-     * 所有对zmq操作都在同一个handle中进行，确保串行
-     */
-    private ZMQHandler zmqHandler;
-    /**
-     *  数据接收观察者
-     */
-    private List<DataReceiveObserver> dataReceiveObservers = new ArrayList<>();
     /**
      * 启动ZMQ
      */
@@ -100,18 +53,78 @@ public abstract class BaseZeroMQ implements IPush {
      * 取消订阅ZMQ
      */
     private static final int UNSUB = 4;
+    /**
+     * 重启的最大时间
+     */
+    private static long RESTART_MAX_THRESHOLD = 5000;
+    /**
+     * 上一次收到数据的时间
+     */
+    private long mLastReceiveDataTime;
+    /**
+     * zmq的上下文
+     */
+    private ZMQ.Context mZMQContext;
+    /**
+     * 与服务器交互的socket
+     */
+    private ZMQ.Socket mCaller;
+    /**
+     * 监听caller状态变化的socket
+     */
+    private ZMQ.Socket mMonitor;
+    /**
+     * 当前使用的数据推送地址
+     */
+    private String mCurrentHost = "";
+    /**
+     * 当前使用的监听地址
+     */
+    private String mCurrentMonitorHost = "";
+
+    /**
+     * 接收数据线程池，暂定两个线程，使用缓存队列
+     */
+    private ThreadPoolExecutor mReceivePool;
+    /**
+     * 监听状态线程池，暂定两个线程，使用缓存队列
+     */
+    private ThreadPoolExecutor mMonitorPool;
+    /**
+     * 接收数据线程池缓存队列，作为变量主要方便调试
+     */
+    private BlockingQueue<Runnable> mReceiveBlockingDeque = new LinkedBlockingDeque<Runnable>();
+    /**
+     * 监听状态线程池缓存队列，作为变量主要方便调试
+     */
+    private LinkedBlockingDeque<Runnable> mMonitorBlockingDeque = new LinkedBlockingDeque<Runnable>();
+
+    /**
+     * 启动一个线程承载对ZMQ操作
+     */
+    private HandlerThread mHandlerThread;
+    /**
+     * 所有对zmq操作都在同一个handle中进行，确保串行
+     */
+    private ZMQHandler mZMQHandler;
+    /**
+     * 数据接收观察者
+     */
+    private List<DataReceiveObserver> mDataReceiveObservers = new ArrayList<>();
 
     //endregion
+
+    //region iPush的基本实现
 
     @Override
     public void start() {
         Log.e(TAG, "invoke start");
-        if (handlerThread != null && handlerThread.isAlive()) {
-            handlerThread.quit();
+        if (mHandlerThread != null && mHandlerThread.isAlive()) {
+            mHandlerThread.quit();
         }
-        handlerThread = new HandlerThread(TAG_QUEUE);
-        handlerThread.start();
-        zmqHandler = new ZMQHandler(handlerThread.getLooper(), this);
+        mHandlerThread = new HandlerThread(TAG_QUEUE);
+        mHandlerThread.start();
+        mZMQHandler = new ZMQHandler(mHandlerThread.getLooper(), this);
 
         if (mReceivePool == null) {
             synchronized (this) {
@@ -121,7 +134,7 @@ public abstract class BaseZeroMQ implements IPush {
                             2,
                             10,
                             TimeUnit.SECONDS,
-                            receiveBlockingDeque,
+                            mReceiveBlockingDeque,
                             new SimpleThreadFactory.Builder().setExtraPrefixName(TAG_REC));
                     mReceivePool.allowCoreThreadTimeOut(true);
                 }
@@ -136,29 +149,32 @@ public abstract class BaseZeroMQ implements IPush {
                             2,
                             10,
                             TimeUnit.SECONDS,
-                            monitorBlockingDeque,
+                            mMonitorBlockingDeque,
                             new SimpleThreadFactory.Builder().setExtraPrefixName(TAG_MONITOR));
                     mMonitorPool.allowCoreThreadTimeOut(true);
                 }
             }
         }
-        zmqHandler.sendEmptyMessage(START);
+        mZMQHandler.sendEmptyMessage(START);
+        //注册自检
+        SelfInspectionHelperHelper.getInstance().registerSelfInspectionObserver(this);
     }
 
     @Override
     public void stop() {
         Log.e(TAG, "invoke stop");
         //为了保证start和stop是串行执行的，所以在同一个handler中处理
-        zmqHandler.sendEmptyMessage(STOP);
+        mZMQHandler.sendEmptyMessage(STOP);
+        //注销自检
+        SelfInspectionHelperHelper.getInstance().unregisterSelfInspectionObserver(this);
     }
-
 
     @Override
     public void subscribe(final List<String> symbols) {
         Message message = Message.obtain();
         message.what = SUB;
         message.obj = symbols;
-        zmqHandler.sendMessage(message);
+        mZMQHandler.sendMessage(message);
     }
 
     @Override
@@ -166,12 +182,12 @@ public abstract class BaseZeroMQ implements IPush {
         Message message = Message.obtain();
         message.what = UNSUB;
         message.obj = symbols;
-        zmqHandler.sendMessage(message);
+        mZMQHandler.sendMessage(message);
     }
 
     @Override
-    public void addDataReceiveObserver(ZeroMQBroker.DataReceiveObserver dataReceiveObserver) {
-         dataReceiveObservers.add(dataReceiveObserver);
+    public void addDataReceiveObserver(DataReceiveObserver dataReceiveObserver) {
+        mDataReceiveObservers.add(dataReceiveObserver);
     }
 
     static class ZMQHandler extends Handler {
@@ -218,10 +234,10 @@ public abstract class BaseZeroMQ implements IPush {
     private void handlerStart() {
         Log.e(TAG, "execute start");
         //启动一个新的时候先把stop都清掉，避免乱调用stop导致启动了又stop
-        zmqHandler.removeMessages(STOP);
+        mZMQHandler.removeMessages(STOP);
 
-        currentHost = distributeHost();
-        currentMonitorHost = distributeMonitorHost();
+        mCurrentHost = distributeHost();
+        mCurrentMonitorHost = distributeMonitorHost();
         mZMQContext = ZMQ.context(1);
         mCaller = mZMQContext.socket(SocketType.SUB);
         //设置连接保持
@@ -243,7 +259,7 @@ public abstract class BaseZeroMQ implements IPush {
 
     private void handleStop() {
         Log.e(TAG, "execute stop" + "Thread  " + Thread.currentThread());
-        handlerThread.quit();
+        mHandlerThread.quit();
         mZMQContext.close();
         mZMQContext = null;
     }
@@ -275,25 +291,53 @@ public abstract class BaseZeroMQ implements IPush {
             e.printStackTrace();
         }
     }
+    //endregion
 
+    //region 自检相关
 
-    protected String getCurrentHost() {
-        return currentHost;
+    /**
+     * 重启，一般是自检发现已经断连则手动重启
+     */
+    private void restart() {
+        Log.e(TAG, "invoke restart");
+        stop();
+        start();
     }
 
-    protected String getCurrentMonitorHost() {
-        return currentMonitorHost;
+    @Override
+    public void onSelfInspection() {
+        //TODO 自检逻辑还需要调整
+        long difference = System.currentTimeMillis() - mLastReceiveDataTime;
+        if (difference > RESTART_MAX_THRESHOLD) {
+            restart();
+        }
     }
+
+    //endregion
+
+    //region 接收推送数据
 
     /**
      * 接收数据
      *
      * @param receiveData
      */
-    protected void onDataReceive(List<String> receiveData){
-        for (DataReceiveObserver dataReceiveObserver : dataReceiveObservers) {
+    protected void onDataReceive(List<String> receiveData) {
+        mLastReceiveDataTime = System.currentTimeMillis();
+        for (DataReceiveObserver dataReceiveObserver : mDataReceiveObservers) {
             dataReceiveObserver.onDataReceive(receiveData);
         }
+    }
+    //endregion
+
+    //region ZMQ业务相关地址
+
+    protected String getCurrentHost() {
+        return mCurrentHost;
+    }
+
+    protected String getCurrentMonitorHost() {
+        return mCurrentMonitorHost;
     }
 
     /**
@@ -309,8 +353,6 @@ public abstract class BaseZeroMQ implements IPush {
      * @return
      */
     protected abstract String distributeMonitorHost();
+    //endregion
 
-    public interface DataReceiveObserver {
-        void onDataReceive(List<String> datas);
-    }
 }

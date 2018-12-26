@@ -2,10 +2,9 @@ package fxchat.com.pushlib.jeromq.push;
 
 import java.util.List;
 
-import fxchat.com.pushlib.jeromq.ZeroMQBroker;
-
 /**
  * Created by wenjiarong on 2018/11/9 0009.
+ * 推送的对外接口，除非万不得已，请勿修改
  */
 public interface IPush {
 
@@ -34,5 +33,5 @@ public interface IPush {
     /**
      * 添加自定义数据接收者
      */
-    void addDataReceiveObserver(ZeroMQBroker.DataReceiveObserver dataReceiveObserver);
+    void addDataReceiveObserver(DataReceiveObserver dataReceiveObserver);
 }
